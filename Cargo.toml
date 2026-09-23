@@ -58,6 +58,8 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 # (#1507). Device-store compatibility retains the legacy created_at column.
 whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "ae3cefd86065872a577bbd0ad5ee21b60c86c616", default-features = false, features = ["sqlite-storage", "tokio-transport", "tokio-runtime", "ureq-client", "tokio-native"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "fs"] }
+axum = { version = "0.7", default-features = false, features = ["tokio", "http1", "json"] }
+tower-http = { version = "0.6", default-features = false, features = ["cors"] }
 # SQLCipher encrypts the archive; the device store shares the same library.
 # Bundle OpenSSL so all release platforms use the same encryption provider.
 rusqlite = { version = "0.40", features = ["bundled-sqlcipher-vendored-openssl"] }

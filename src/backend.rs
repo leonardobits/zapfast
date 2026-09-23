@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 
 use crate::model::{Chat, ChatId, Contact, Gif, GifError, Message, PollDraft, StickerPack};
 use crate::paths::AppDirs;
+pub use crate::mcp::McpCommand;
 
 // Re-exported so the picker can detect pasted Signal pack links.
 mod read_sync;
@@ -113,6 +114,8 @@ pub struct CreatedPoll {
 
 #[derive(Clone, Debug)]
 pub enum Command {
+    /// Dispatched from the embedded MCP HTTP server.
+    Mcp(McpCommand),
     RefreshPoll {
         chat: ChatId,
         message: String,
@@ -621,6 +624,7 @@ impl Backend {
             .spawn(move || {
                 runtime.block_on(async move {
                     if started.await.is_ok() {
+                        tokio::spawn(crate::mcp::start_server(worker_commands.clone(), 8765));
                         worker::run(dirs, event_tx, worker_commands, command_rx, waker).await;
                     }
                 });

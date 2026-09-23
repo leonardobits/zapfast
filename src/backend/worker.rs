@@ -38,7 +38,7 @@ mod device_store;
 mod poll_history;
 mod polls;
 
-use super::{Command, Event, LinkStatus, Waker, read_sync::ReadSync};
+use super::{Command, Event, LinkStatus, McpCommand, Waker, read_sync::ReadSync};
 use crate::app::PAGE;
 use crate::archive::Archive;
 use crate::model::{
@@ -2874,6 +2874,23 @@ impl Worker {
             }
         }
         match command {
+            Command::Mcp(mcp_cmd) => match mcp_cmd {
+                McpCommand::SearchChats { query, limit, reply } => {
+                    self.handle_mcp_search_chats(query, limit, reply);
+                }
+                McpCommand::GetMessages { chat_id, limit, before, reply } => {
+                    self.handle_mcp_get_messages(chat_id, limit, before, reply);
+                }
+                McpCommand::SearchMessages { query, limit, reply } => {
+                    self.handle_mcp_search_messages(query, limit, reply);
+                }
+                McpCommand::SendMessage { chat_id, text, reply } => {
+                    self.handle_mcp_send_message(chat_id, text, reply);
+                }
+                McpCommand::ReplyMessage { chat_id, message_id, text, reply } => {
+                    self.handle_mcp_reply_message(chat_id, message_id, text, reply);
+                }
+            },
             Command::RefreshPoll { chat, message } => self.refresh_poll(chat, message),
             Command::PollHistoryFailed {
                 chat,
@@ -3542,6 +3559,321 @@ impl Worker {
                 false
             }
         }
+    }
+
+    // --- MCP Handler Methods ---
+
+    fn handle_mcp_search_chats(
+        &self,
+        query: Option<String>,
+        limit: usize,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<crate::mcp::McpChat>, String>>,
+    ) {
+        let now = crate::util::now();
+        let result = match self.archive.chats() {
+            Ok(mut chats) => {
+                chats.retain(|chat| chat.last.is_some() || self.canonical_str(&chat.id) == chat.id);
+                for chat in &mut chats {
+                    self.polish_chat(chat);
+                }
+                if let Some(ref q) = query {
+                    let needle = q.to_lowercase();
+                    chats.retain(|chat| {
+                        chat.name.to_lowercase().contains(&needle)
+                            || chat.id.to_lowercase().contains(&needle)
+                    });
+                }
+                let chats_mcp: Vec<crate::mcp::McpChat> = chats
+                    .into_iter()
+                    .take(limit)
+                    .map(|c| {
+                        let last_summary = c.last.as_ref().map(|l| l.summary.clone());
+                        let kind_str = match c.kind {
+                            ChatKind::Direct => "direct",
+                            ChatKind::Group => "group",
+                            ChatKind::Broadcast => "broadcast",
+                        };
+                        crate::mcp::McpChat {
+                            id: c.id,
+                            name: c.name,
+                            kind: kind_str.to_owned(),
+                            unread: c.unread,
+                            last_activity: c.last_activity,
+                            archived: c.archived,
+                            pinned: c.pinned,
+                            muted: c.muted(now),
+                            last_message: last_summary,
+                        }
+                    })
+                    .collect();
+                Ok(chats_mcp)
+            }
+            Err(err) => Err(format!("Database error reading chats: {err}")),
+        };
+        let _ = reply.send(result);
+    }
+
+    fn handle_mcp_get_messages(
+        &self,
+        chat_id: String,
+        limit: usize,
+        before: Option<(i64, String)>,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<crate::mcp::McpMessage>, String>>,
+    ) {
+        let canonical_id = self.canonical_str(&chat_id);
+        let before_param = before.as_ref().map(|(t, id)| (*t, id.as_str()));
+        let result = match self.archive.messages(&canonical_id, before_param, limit) {
+            Ok(mut messages) => {
+                for m in &mut messages {
+                    self.polish(m);
+                }
+                let msgs: Vec<crate::mcp::McpMessage> = messages
+                    .into_iter()
+                    .map(|m| {
+                        let status_str = match m.status {
+                            Delivery::None => "none",
+                            Delivery::Pending => "pending",
+                            Delivery::Sent => "sent",
+                            Delivery::Delivered => "delivered",
+                            Delivery::Read => "read",
+                            Delivery::Played => "played",
+                            Delivery::Failed => "failed",
+                        };
+                        let quoted_summary = m.quoted.map(|q| {
+                            format!("{}: {}", q.sender_name.unwrap_or(q.sender), q.summary)
+                        });
+                        crate::mcp::McpMessage {
+                            id: m.id,
+                            chat: m.chat,
+                            sender: m.sender,
+                            sender_name: m.sender_name,
+                            from_me: m.from_me,
+                            timestamp: m.timestamp,
+                            summary: m.summary(),
+                            status: status_str.to_owned(),
+                            quoted: quoted_summary,
+                        }
+                    })
+                    .collect();
+                Ok(msgs)
+            }
+            Err(err) => Err(format!("Database error reading messages: {err}")),
+        };
+        let _ = reply.send(result);
+    }
+
+    fn handle_mcp_search_messages(
+        &self,
+        query: String,
+        limit: usize,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<crate::mcp::McpMessage>, String>>,
+    ) {
+        let result = match self.archive.search_messages(&query, limit) {
+            Ok(mut messages) => {
+                for m in &mut messages {
+                    self.polish(m);
+                }
+                let msgs: Vec<crate::mcp::McpMessage> = messages
+                    .into_iter()
+                    .map(|m| {
+                        let status_str = match m.status {
+                            Delivery::None => "none",
+                            Delivery::Pending => "pending",
+                            Delivery::Sent => "sent",
+                            Delivery::Delivered => "delivered",
+                            Delivery::Read => "read",
+                            Delivery::Played => "played",
+                            Delivery::Failed => "failed",
+                        };
+                        let quoted_summary = m.quoted.map(|q| {
+                            format!("{}: {}", q.sender_name.unwrap_or(q.sender), q.summary)
+                        });
+                        crate::mcp::McpMessage {
+                            id: m.id,
+                            chat: m.chat,
+                            sender: m.sender,
+                            sender_name: m.sender_name,
+                            from_me: m.from_me,
+                            timestamp: m.timestamp,
+                            summary: m.summary(),
+                            status: status_str.to_owned(),
+                            quoted: quoted_summary,
+                        }
+                    })
+                    .collect();
+                Ok(msgs)
+            }
+            Err(err) => Err(format!("Database error searching messages: {err}")),
+        };
+        let _ = reply.send(result);
+    }
+
+    fn handle_mcp_send_message(
+        &mut self,
+        chat_id: String,
+        text: String,
+        reply: tokio::sync::oneshot::Sender<Result<crate::mcp::McpSendResult, String>>,
+    ) {
+        let canonical_id = self.canonical_str(&chat_id);
+        let (Some(client), Some(jid)) = (self.client.clone(), Self::jid_of(&canonical_id)) else {
+            let _ = reply.send(Err("Not connected to WhatsApp".to_owned()));
+            return;
+        };
+        let writable = self.privacy_ready
+            && match self.archive.chat(&canonical_id) {
+                Ok(Some(chat)) => chat.can_send(),
+                Ok(None) => ChatKind::from_id(&canonical_id) != ChatKind::Broadcast,
+                Err(_) => false,
+            };
+        if !writable {
+            let _ = reply.send(Err("This conversation is read-only in ZapFast".to_owned()));
+            return;
+        }
+
+        let mut message = outgoing_text(text.clone(), None, &[]);
+        let expiration = self.apply_ephemeral(&canonical_id, &mut message);
+        let id = client.generate_message_id();
+        let row = Message {
+            id: id.clone(),
+            chat: canonical_id.clone(),
+            sender: self.me(),
+            sender_name: None,
+            from_me: true,
+            timestamp: crate::util::now(),
+            content: Content::text(text),
+            status: Delivery::Pending,
+            delivered_at: None,
+            read_at: None,
+            quoted: None,
+            reactions: Vec::new(),
+            edited: false,
+            mentions: Vec::new(),
+            forwarded: false,
+            thumbnail: None,
+        };
+        self.store_message(row, Some(message.encode_to_vec()), None);
+        tokio::spawn(send_outgoing(
+            client,
+            self.commands.clone(),
+            canonical_id.clone(),
+            jid,
+            id.clone(),
+            message,
+            expiration,
+        ));
+
+        let _ = reply.send(Ok(crate::mcp::McpSendResult {
+            id,
+            chat: canonical_id,
+            status: "pending".to_owned(),
+        }));
+    }
+
+    fn handle_mcp_reply_message(
+        &mut self,
+        chat_id: String,
+        message_id: String,
+        text: String,
+        reply: tokio::sync::oneshot::Sender<Result<crate::mcp::McpSendResult, String>>,
+    ) {
+        let canonical_id = self.canonical_str(&chat_id);
+        let (Some(client), Some(jid)) = (self.client.clone(), Self::jid_of(&canonical_id)) else {
+            let _ = reply.send(Err("Not connected to WhatsApp".to_owned()));
+            return;
+        };
+        let writable = self.privacy_ready
+            && match self.archive.chat(&canonical_id) {
+                Ok(Some(chat)) => chat.can_send(),
+                Ok(None) => ChatKind::from_id(&canonical_id) != ChatKind::Broadcast,
+                Err(_) => false,
+            };
+        if !writable {
+            let _ = reply.send(Err("This conversation is read-only in ZapFast".to_owned()));
+            return;
+        }
+
+        let mut quoted_row = None;
+        let context = {
+            if let Ok(Some(raw)) = self.archive.raw(&canonical_id, &message_id) {
+                if let Ok(quoted) = wa::Message::decode_from_slice(&raw) {
+                    if let Ok(Some(row)) = self.archive.message(&canonical_id, &message_id) {
+                        let sender = Self::jid_of(&row.sender).unwrap_or_else(|| jid.clone());
+                        let ctx = whatsapp_rust::wacore::proto_helpers::build_quote_context_with_info(
+                            row.id.clone(),
+                            &sender,
+                            &jid,
+                            &jid,
+                            &quoted,
+                        );
+                        quoted_row = Some(row);
+                        Some(ctx)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        if context.is_none() {
+            let _ = reply.send(Err(format!(
+                "Original message {message_id} not found in archive to quote"
+            )));
+            return;
+        }
+
+        let mut message = outgoing_text(text.clone(), context, &[]);
+        let expiration = self.apply_ephemeral(&canonical_id, &mut message);
+        let id = client.generate_message_id();
+        let row = Message {
+            id: id.clone(),
+            chat: canonical_id.clone(),
+            sender: self.me(),
+            sender_name: None,
+            from_me: true,
+            timestamp: crate::util::now(),
+            content: Content::text(text),
+            status: Delivery::Pending,
+            delivered_at: None,
+            read_at: None,
+            quoted: quoted_row.map(|row| Quoted {
+                mentions: row.mentions.clone(),
+                id: row.id,
+                sender_name: if row.from_me {
+                    Some("You".to_owned())
+                } else {
+                    row.sender_name
+                        .clone()
+                        .or_else(|| self.name_for(&row.sender))
+                },
+                sender: row.sender,
+                summary: row.content.summary(),
+            }),
+            reactions: Vec::new(),
+            edited: false,
+            mentions: Vec::new(),
+            forwarded: false,
+            thumbnail: None,
+        };
+        self.store_message(row, Some(message.encode_to_vec()), None);
+        tokio::spawn(send_outgoing(
+            client,
+            self.commands.clone(),
+            canonical_id.clone(),
+            jid,
+            id.clone(),
+            message,
+            expiration,
+        ));
+
+        let _ = reply.send(Ok(crate::mcp::McpSendResult {
+            id,
+            chat: canonical_id,
+            status: "pending".to_owned(),
+        }));
     }
 
     fn send_text(
