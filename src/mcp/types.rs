@@ -12,7 +12,27 @@ pub struct McpChat {
     pub archived: bool,
     pub pinned: bool,
     pub muted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_message: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct McpReaction {
+    pub emoji: String,
+    pub sender: String,
+    pub from_me: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct McpMedia {
+    pub media_type: String,
+    pub mime: String,
+    pub size_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caption: Option<String>,
+    pub is_downloaded: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -20,12 +40,26 @@ pub struct McpMessage {
     pub id: String,
     pub chat: String,
     pub sender: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub sender_name: Option<String>,
     pub from_me: bool,
     pub timestamp: i64,
     pub summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media: Option<McpMedia>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub reactions: Vec<McpReaction>,
     pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub quoted: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct McpUnreadChatOverview {
+    pub chat: McpChat,
+    pub messages: Vec<McpMessage>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -35,8 +69,40 @@ pub struct McpSendResult {
     pub status: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct McpActionResult {
+    pub action: String,
+    pub chat_id: String,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct McpChatContext {
+    pub chat_id: String,
+    pub name: String,
+    pub kind: String,
+    pub unread: u32,
+    pub transcript: String,
+    pub messages_count: usize,
+}
+
+#[derive(Debug)]
 pub enum McpCommand {
+    GetChatContext {
+        chat_id: String,
+        limit: usize,
+        reply: tokio::sync::oneshot::Sender<Result<McpChatContext, String>>,
+    },
+    PollNewMessages {
+        since_timestamp: Option<i64>,
+        chat_id: Option<String>,
+        limit: usize,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<McpMessage>, String>>,
+    },
     SearchChats {
         query: Option<String>,
         limit: usize,
@@ -63,6 +129,51 @@ pub enum McpCommand {
         message_id: String,
         text: String,
         reply: tokio::sync::oneshot::Sender<Result<McpSendResult, String>>,
+    },
+    ReactMessage {
+        chat_id: String,
+        message_id: String,
+        emoji: String,
+        reply: tokio::sync::oneshot::Sender<Result<bool, String>>,
+    },
+    MarkRead {
+        chat_id: String,
+        reply: tokio::sync::oneshot::Sender<Result<bool, String>>,
+    },
+    GetUnreadOverview {
+        chat_limit: usize,
+        message_limit: usize,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<McpUnreadChatOverview>, String>>,
+    },
+    DownloadAttachment {
+        chat_id: String,
+        message_id: String,
+        reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+    },
+    EditMessage {
+        chat_id: String,
+        message_id: String,
+        text: String,
+        reply: tokio::sync::oneshot::Sender<Result<McpSendResult, String>>,
+    },
+    DeleteMessage {
+        chat_id: String,
+        message_id: String,
+        reply: tokio::sync::oneshot::Sender<Result<McpSendResult, String>>,
+    },
+    BatchEditMessages {
+        chat_id: Option<String>,
+        edits: Vec<serde_json::Value>,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<McpActionResult>, String>>,
+    },
+    BatchDeleteMessages {
+        chat_id: Option<String>,
+        message_ids: Vec<String>,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<McpActionResult>, String>>,
+    },
+    BatchActions {
+        actions: Vec<serde_json::Value>,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<McpActionResult>, String>>,
     },
 }
 

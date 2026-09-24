@@ -112,7 +112,7 @@ pub struct CreatedPoll {
     pub recipients: Vec<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum Command {
     /// Dispatched from the embedded MCP HTTP server.
     Mcp(McpCommand),

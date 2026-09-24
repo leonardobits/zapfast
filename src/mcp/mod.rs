@@ -5,4 +5,7 @@ pub mod tools;
 pub mod types;
 
 pub use server::start_server;
-pub use types::{McpChat, McpCommand, McpMessage, McpSendResult};
+pub use types::{
+    McpActionResult, McpChat, McpChatContext, McpCommand, McpMedia, McpMessage, McpReaction,
+    McpSendResult, McpUnreadChatOverview,
+};
