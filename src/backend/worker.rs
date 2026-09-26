@@ -43,7 +43,9 @@ mod poll_history;
 mod polls;
 mod stickers;
 
-use super::{Command, Event, LinkStatus, Refusal, Unsent, Waker, read_sync::ReadSync};
+use super::{
+    Command, Event, LinkStatus, McpCommand, Refusal, Unsent, Waker, read_sync::ReadSync,
+};
 use crate::app::PAGE;
 use crate::archive::Archive;
 use crate::model::{
@@ -511,6 +513,9 @@ pub async fn run(
         favorites_recovered,
         favorites_recovering: false,
         downloads: HashSet::new(),
+        mcp_shutdown: None,
+        mcp_port: 8765,
+        mcp_token: String::new(),
         read_sync: ReadSync::default(),
         favorite_chats: Default::default(),
         poll_decrypting: 0,
@@ -579,6 +584,9 @@ pub async fn run(
                 worker.prune_waiting_receipts();
             }
         }
+    }
+    if let Some(shutdown_tx) = worker.mcp_shutdown.take() {
+        let _ = shutdown_tx.send(true);
     }
     worker.stop_bot().await;
 }
@@ -783,6 +791,10 @@ struct Worker {
     downloads: HashSet<(ChatId, String, Option<usize>)>,
     /// Serial forward in flight. The next send waits for the running one.
     forward_queue: Option<ForwardQueue<ForwardJob>>,
+    /// Shutdown channel sender for the active MCP server instance.
+    mcp_shutdown: Option<tokio::sync::watch::Sender<bool>>,
+    mcp_port: u16,
+    mcp_token: String,
 }
 
 /// A queued forward: where it goes, the protobuf, and its disappearing timer.
@@ -4015,6 +4027,124 @@ impl Worker {
             }
         }
         match command {
+            Command::ConfigureMcp {
+                enabled,
+                port,
+                token,
+            } => {
+                self.configure_mcp(enabled, port, token);
+            }
+            Command::Mcp(mcp_cmd) => match mcp_cmd {
+                McpCommand::GetChatContext {
+                    chat_id,
+                    limit,
+                    reply,
+                } => {
+                    self.handle_mcp_get_chat_context(chat_id, limit, reply);
+                }
+                McpCommand::PollNewMessages {
+                    since_timestamp,
+                    chat_id,
+                    limit,
+                    reply,
+                } => {
+                    self.handle_mcp_poll_new_messages(since_timestamp, chat_id, limit, reply);
+                }
+                McpCommand::GetUnreadOverview {
+                    chat_limit,
+                    message_limit,
+                    reply,
+                } => {
+                    self.handle_mcp_get_unread_overview(chat_limit, message_limit, reply);
+                }
+                McpCommand::SearchChats {
+                    query,
+                    limit,
+                    reply,
+                } => {
+                    self.handle_mcp_search_chats(query, limit, reply);
+                }
+                McpCommand::GetMessages {
+                    chat_id,
+                    limit,
+                    before,
+                    reply,
+                } => {
+                    self.handle_mcp_get_messages(chat_id, limit, before, reply);
+                }
+                McpCommand::SearchMessages {
+                    query,
+                    limit,
+                    reply,
+                } => {
+                    self.handle_mcp_search_messages(query, limit, reply);
+                }
+                McpCommand::SendMessage {
+                    chat_id,
+                    text,
+                    reply,
+                } => {
+                    self.handle_mcp_send_message(chat_id, text, reply);
+                }
+                McpCommand::ReplyMessage {
+                    chat_id,
+                    message_id,
+                    text,
+                    reply,
+                } => {
+                    self.handle_mcp_reply_message(chat_id, message_id, text, reply);
+                }
+                McpCommand::ReactMessage {
+                    chat_id,
+                    message_id,
+                    emoji,
+                    reply,
+                } => {
+                    self.handle_mcp_react_message(chat_id, message_id, emoji, reply);
+                }
+                McpCommand::MarkRead { chat_id, reply } => {
+                    self.handle_mcp_mark_read(chat_id, reply);
+                }
+                McpCommand::DownloadAttachment {
+                    chat_id,
+                    message_id,
+                    reply,
+                } => {
+                    self.handle_mcp_download_attachment(chat_id, message_id, reply);
+                }
+                McpCommand::EditMessage {
+                    chat_id,
+                    message_id,
+                    text,
+                    reply,
+                } => {
+                    self.handle_mcp_edit_message(chat_id, message_id, text, reply);
+                }
+                McpCommand::DeleteMessage {
+                    chat_id,
+                    message_id,
+                    reply,
+                } => {
+                    self.handle_mcp_delete_message(chat_id, message_id, reply);
+                }
+                McpCommand::BatchEditMessages {
+                    chat_id,
+                    edits,
+                    reply,
+                } => {
+                    self.handle_mcp_batch_edit_messages(chat_id, edits, reply);
+                }
+                McpCommand::BatchDeleteMessages {
+                    chat_id,
+                    message_ids,
+                    reply,
+                } => {
+                    self.handle_mcp_batch_delete_messages(chat_id, message_ids, reply);
+                }
+                McpCommand::BatchActions { actions, reply } => {
+                    self.handle_mcp_batch_actions(actions, reply);
+                }
+            },
             Command::RefreshPoll { chat, message } => self.refresh_poll(chat, message),
             Command::PollHistoryFailed {
                 chat,
@@ -5343,6 +5473,1186 @@ impl Worker {
             unsent,
             reason,
         });
+    }
+
+    // --- mcp -------------------------------------------------------------
+
+    fn polish_and_convert_mcp_message(&self, m: &mut Message) -> crate::mcp::McpMessage {
+        self.polish(m);
+        let status_str = match m.status {
+            Delivery::None => "none",
+            Delivery::Pending => "pending",
+            Delivery::Sent => "sent",
+            Delivery::Delivered => "delivered",
+            Delivery::Read => "read",
+            Delivery::Played => "played",
+            Delivery::Failed => "failed",
+        };
+        let summary = m.summary();
+        let quoted_summary = m.quoted.as_ref().map(|q| {
+            format!(
+                "{}: {}",
+                q.sender_name.as_deref().unwrap_or(&q.sender),
+                q.summary
+            )
+        });
+        let text = match &m.content {
+            Content::Text { text, .. } => Some(text.clone()),
+            Content::Image { caption, .. }
+            | Content::Video { caption, .. }
+            | Content::Document { caption, .. } => caption.clone(),
+            _ => None,
+        };
+        let media = m.content.media().map(|med| {
+            let media_type = match &m.content {
+                Content::Image { .. } => "image",
+                Content::Video { .. } => "video",
+                Content::Audio { voice_note, .. } => {
+                    if *voice_note {
+                        "voice_note"
+                    } else {
+                        "audio"
+                    }
+                }
+                Content::Document { .. } => "document",
+                Content::Sticker { .. } => "sticker",
+                _ => "other",
+            };
+            let caption = match &m.content {
+                Content::Image { caption, .. }
+                | Content::Video { caption, .. }
+                | Content::Document { caption, .. } => caption.clone(),
+                _ => None,
+            };
+            crate::mcp::McpMedia {
+                media_type: media_type.to_string(),
+                mime: med.mime.clone(),
+                size_bytes: med.size,
+                file_path: med.path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                caption,
+                is_downloaded: med.path.is_some(),
+            }
+        });
+        let reactions: Vec<crate::mcp::McpReaction> = m
+            .reactions
+            .iter()
+            .map(|r| crate::mcp::McpReaction {
+                emoji: r.emoji.clone(),
+                sender: r.sender.clone(),
+                from_me: r.from_me,
+            })
+            .collect();
+
+        crate::mcp::McpMessage {
+            id: m.id.clone(),
+            chat: m.chat.clone(),
+            sender: m.sender.clone(),
+            sender_name: m.sender_name.clone(),
+            from_me: m.from_me,
+            timestamp: m.timestamp,
+            summary,
+            text,
+            media,
+            reactions,
+            status: status_str.to_owned(),
+            quoted: quoted_summary,
+        }
+    }
+
+    fn resolve_chat_by_name_or_id(&self, query_or_id: &str) -> Option<crate::model::Chat> {
+        let canonical = self.canonical_str(query_or_id);
+        if let Ok(Some(mut c)) = self.archive.chat(&canonical) {
+            self.polish_chat(&mut c);
+            return Some(c);
+        }
+
+        if let Ok(mut chats) = self.archive.chats() {
+            for c in &mut chats {
+                self.polish_chat(c);
+            }
+            let needle = query_or_id.to_lowercase().replace(' ', "");
+            // 1. Direct contains in chat name or exact ID match
+            if let Some(c) = chats.iter().find(|c| {
+                let name_clean = c.name.to_lowercase().replace(' ', "");
+                name_clean.contains(&needle) || c.id == query_or_id || c.id.contains(&needle)
+            }) {
+                return Some(c.clone());
+            }
+
+            // 2. Collapsed duplicate chars fuzzy match (e.g. "locarelo" matches "loccarelo")
+            let needle_collapsed: String = needle.chars().fold(String::new(), |mut acc, c| {
+                if acc.chars().last() != Some(c) {
+                    acc.push(c);
+                }
+                acc
+            });
+            if let Some(c) = chats.iter().find(|c| {
+                let name_collapsed: String =
+                    c.name
+                        .to_lowercase()
+                        .chars()
+                        .fold(String::new(), |mut acc, ch| {
+                            if acc.chars().last() != Some(ch) {
+                                acc.push(ch);
+                            }
+                            acc
+                        });
+                name_collapsed.contains(&needle_collapsed)
+            }) {
+                return Some(c.clone());
+            }
+
+            // 3. Fallback: needle contains full chat name only if name has at least 4 characters
+            if let Some(c) = chats.iter().find(|c| {
+                let name_clean = c.name.to_lowercase().replace(' ', "");
+                name_clean.len() >= 4 && needle.contains(&name_clean)
+            }) {
+                return Some(c.clone());
+            }
+        }
+        None
+    }
+
+    fn handle_mcp_get_chat_context(
+        &self,
+        chat_id: String,
+        limit: usize,
+        reply: tokio::sync::oneshot::Sender<Result<crate::mcp::McpChatContext, String>>,
+    ) {
+        let chat = match self.resolve_chat_by_name_or_id(&chat_id) {
+            Some(c) => c,
+            None => {
+                let _ = reply.send(Err(format!("Chat '{chat_id}' not found by ID or name")));
+                return;
+            }
+        };
+        let canonical_id = chat.id.clone();
+
+        let messages = match self.archive.messages(&canonical_id, None, limit) {
+            Ok(mut msgs) => {
+                for m in &mut msgs {
+                    self.polish(m);
+                }
+                msgs
+            }
+            Err(err) => {
+                let _ = reply.send(Err(format!("Database error reading messages: {err}")));
+                return;
+            }
+        };
+
+        let kind_str = match chat.kind {
+            ChatKind::Direct => "Direct Message",
+            ChatKind::Group => "Group Chat",
+            ChatKind::Broadcast => "Broadcast List",
+        };
+
+        let count = messages.len();
+        let mut transcript = String::new();
+        transcript.push_str(&format!(
+            "# WhatsApp Conversation Context\n**Chat**: {} ({})\n**ID**: `{}` | **Unread**: {}\n\n--- Messages History (Chronological) ---\n",
+            chat.name, kind_str, chat.id, chat.unread
+        ));
+
+        for m in messages.into_iter().rev() {
+            let time_str = crate::util::copy_stamp(m.timestamp);
+
+            let sender_label = if m.from_me {
+                "You".to_string()
+            } else {
+                m.sender_name
+                    .clone()
+                    .unwrap_or_else(|| self.name_for(&m.sender).unwrap_or_else(|| m.sender.clone()))
+            };
+
+            let mut msg_line = format!("[{time_str}] {sender_label} (ID: `{}`): ", m.id);
+
+            if let Some(ref q) = m.quoted {
+                msg_line.push_str(&format!(
+                    "(Replying to {}: \"{}\") ",
+                    q.sender_name.as_deref().unwrap_or(&q.sender),
+                    q.summary
+                ));
+            }
+
+            match &m.content {
+                Content::Text { text, .. } => {
+                    msg_line.push_str(text);
+                }
+                Content::Image { caption, media } => {
+                    msg_line.push_str("[Photo");
+                    if let Some(c) = caption {
+                        msg_line.push_str(&format!(" - Caption: \"{c}\""));
+                    }
+                    if let Some(p) = &media.path {
+                        msg_line.push_str(&format!(" - Local file: `{}`", p.display()));
+                    }
+                    msg_line.push(']');
+                }
+                Content::Video { caption, media, .. } => {
+                    msg_line.push_str("[Video");
+                    if let Some(c) = caption {
+                        msg_line.push_str(&format!(" - Caption: \"{c}\""));
+                    }
+                    if let Some(p) = &media.path {
+                        msg_line.push_str(&format!(" - Local file: `{}`", p.display()));
+                    }
+                    msg_line.push(']');
+                }
+                Content::Audio {
+                    voice_note,
+                    media,
+                    seconds,
+                    ..
+                } => {
+                    let label = if *voice_note {
+                        "Voice Message"
+                    } else {
+                        "Audio"
+                    };
+                    msg_line.push_str(&format!("[{label}"));
+                    if let Some(sec) = seconds {
+                        msg_line.push_str(&format!(" ({}s)", sec));
+                    }
+                    if let Some(p) = &media.path {
+                        msg_line.push_str(&format!(" - Local file: `{}`", p.display()));
+                    }
+                    msg_line.push(']');
+                }
+                Content::Document {
+                    file_name,
+                    caption,
+                    media,
+                    ..
+                } => {
+                    msg_line.push_str(&format!("[Document: {file_name}"));
+                    if let Some(c) = caption {
+                        msg_line.push_str(&format!(" - Caption: \"{c}\""));
+                    }
+                    if let Some(p) = &media.path {
+                        msg_line.push_str(&format!(" - Local file: `{}`", p.display()));
+                    }
+                    msg_line.push(']');
+                }
+                other => {
+                    msg_line.push_str(&format!("[{}]", other.summary()));
+                }
+            }
+
+            if !m.reactions.is_empty() {
+                let reacts: Vec<String> = m.reactions.iter().map(|r| r.emoji.clone()).collect();
+                msg_line.push_str(&format!(" [Reactions: {}]", reacts.join(" ")));
+            }
+
+            transcript.push_str(&msg_line);
+            transcript.push('\n');
+        }
+
+        let result = crate::mcp::McpChatContext {
+            chat_id: canonical_id,
+            name: chat.name,
+            kind: kind_str.to_string(),
+            unread: chat.unread,
+            transcript,
+            messages_count: count,
+        };
+
+        let _ = reply.send(Ok(result));
+    }
+
+    fn handle_mcp_poll_new_messages(
+        &self,
+        since_timestamp: Option<i64>,
+        chat_id: Option<String>,
+        limit: usize,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<crate::mcp::McpMessage>, String>>,
+    ) {
+        let result = match chat_id {
+            Some(cid) => {
+                let canonical_id = self.canonical_str(&cid);
+                match self.archive.messages(&canonical_id, None, limit) {
+                    Ok(mut msgs) => {
+                        if let Some(since) = since_timestamp {
+                            msgs.retain(|m| m.timestamp > since);
+                        }
+                        let result_msgs = msgs
+                            .iter_mut()
+                            .map(|m| self.polish_and_convert_mcp_message(m))
+                            .collect();
+                        Ok(result_msgs)
+                    }
+                    Err(err) => Err(format!("Database error reading messages: {err}")),
+                }
+            }
+            None => match self.archive.chats() {
+                Ok(mut chats) => {
+                    chats.retain(|c| c.unread > 0);
+                    let mut all_msgs = Vec::new();
+                    for c in chats.iter().take(10) {
+                        if let Ok(mut msgs) = self.archive.messages(&c.id, None, 5) {
+                            if let Some(since) = since_timestamp {
+                                msgs.retain(|m| m.timestamp > since);
+                            }
+                            for m in &mut msgs {
+                                all_msgs.push(self.polish_and_convert_mcp_message(m));
+                            }
+                        }
+                    }
+                    all_msgs.truncate(limit);
+                    Ok(all_msgs)
+                }
+                Err(err) => Err(format!("Database error: {err}")),
+            },
+        };
+        let _ = reply.send(result);
+    }
+
+    fn handle_mcp_get_unread_overview(
+        &self,
+        chat_limit: usize,
+        message_limit: usize,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<crate::mcp::McpUnreadChatOverview>, String>>,
+    ) {
+        let now = crate::util::now();
+        let result = match self.archive.chats() {
+            Ok(mut chats) => {
+                chats.retain(|chat| chat.unread > 0);
+                for chat in &mut chats {
+                    self.polish_chat(chat);
+                }
+                let overview: Vec<crate::mcp::McpUnreadChatOverview> = chats
+                    .into_iter()
+                    .take(chat_limit)
+                    .map(|c| {
+                        let last_summary = c.last.as_ref().map(|l| l.summary.clone());
+                        let kind_str = match c.kind {
+                            ChatKind::Direct => "direct",
+                            ChatKind::Group => "group",
+                            ChatKind::Broadcast => "broadcast",
+                        };
+                        let muted = c.muted(now);
+                        let chat_mcp = crate::mcp::McpChat {
+                            id: c.id.clone(),
+                            name: c.name,
+                            kind: kind_str.to_owned(),
+                            unread: c.unread,
+                            last_activity: c.last_activity,
+                            archived: c.archived,
+                            pinned: c.pinned,
+                            muted,
+                            last_message: last_summary,
+                        };
+
+                        let messages = match self.archive.messages(&c.id, None, message_limit) {
+                            Ok(mut msgs) => msgs
+                                .iter_mut()
+                                .map(|m| self.polish_and_convert_mcp_message(m))
+                                .collect(),
+                            Err(_) => Vec::new(),
+                        };
+
+                        crate::mcp::McpUnreadChatOverview {
+                            chat: chat_mcp,
+                            messages,
+                        }
+                    })
+                    .collect();
+                Ok(overview)
+            }
+            Err(err) => Err(format!("Database error reading chats: {err}")),
+        };
+        let _ = reply.send(result);
+    }
+
+    fn handle_mcp_search_chats(
+        &self,
+        query: Option<String>,
+        limit: usize,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<crate::mcp::McpChat>, String>>,
+    ) {
+        let now = crate::util::now();
+        let result = match self.archive.chats() {
+            Ok(mut chats) => {
+                chats.retain(|chat| chat.last.is_some() || self.canonical_str(&chat.id) == chat.id);
+                for chat in &mut chats {
+                    self.polish_chat(chat);
+                }
+                if let Some(ref q) = query {
+                    let needle = q.to_lowercase();
+                    chats.retain(|chat| {
+                        chat.name.to_lowercase().contains(&needle)
+                            || chat.id.to_lowercase().contains(&needle)
+                    });
+                }
+                let chats_mcp: Vec<crate::mcp::McpChat> = chats
+                    .into_iter()
+                    .take(limit)
+                    .map(|c| {
+                        let last_summary = c.last.as_ref().map(|l| l.summary.clone());
+                        let kind_str = match c.kind {
+                            ChatKind::Direct => "direct",
+                            ChatKind::Group => "group",
+                            ChatKind::Broadcast => "broadcast",
+                        };
+                        let muted = c.muted(now);
+                        crate::mcp::McpChat {
+                            id: c.id,
+                            name: c.name,
+                            kind: kind_str.to_owned(),
+                            unread: c.unread,
+                            last_activity: c.last_activity,
+                            archived: c.archived,
+                            pinned: c.pinned,
+                            muted,
+                            last_message: last_summary,
+                        }
+                    })
+                    .collect();
+                Ok(chats_mcp)
+            }
+            Err(err) => Err(format!("Database error reading chats: {err}")),
+        };
+        let _ = reply.send(result);
+    }
+
+    fn handle_mcp_get_messages(
+        &self,
+        chat_id: String,
+        limit: usize,
+        before: Option<(i64, String)>,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<crate::mcp::McpMessage>, String>>,
+    ) {
+        let canonical_id = self.canonical_str(&chat_id);
+        let before_param = before.as_ref().map(|(t, id)| (*t, id.as_str()));
+        let result = match self.archive.messages(&canonical_id, before_param, limit) {
+            Ok(mut messages) => {
+                let msgs = messages
+                    .iter_mut()
+                    .map(|m| self.polish_and_convert_mcp_message(m))
+                    .collect();
+                Ok(msgs)
+            }
+            Err(err) => Err(format!("Database error reading messages: {err}")),
+        };
+        let _ = reply.send(result);
+    }
+
+    fn handle_mcp_search_messages(
+        &self,
+        query: String,
+        limit: usize,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<crate::mcp::McpMessage>, String>>,
+    ) {
+        let result = match self.archive.search_messages(&query, limit) {
+            Ok(mut messages) => {
+                let msgs = messages
+                    .iter_mut()
+                    .map(|m| self.polish_and_convert_mcp_message(m))
+                    .collect();
+                Ok(msgs)
+            }
+            Err(err) => Err(format!("Database error searching messages: {err}")),
+        };
+        let _ = reply.send(result);
+    }
+
+    fn handle_mcp_send_message(
+        &mut self,
+        chat_id: String,
+        text: String,
+        reply: tokio::sync::oneshot::Sender<Result<crate::mcp::McpSendResult, String>>,
+    ) {
+        let canonical_id = self
+            .resolve_chat_by_name_or_id(&chat_id)
+            .map(|c| c.id)
+            .unwrap_or_else(|| self.canonical_str(&chat_id));
+        let (Some(client), Some(jid)) = (self.client.clone(), Self::jid_of(&canonical_id)) else {
+            let _ = reply.send(Err("Not connected to WhatsApp".to_owned()));
+            return;
+        };
+        let writable = self.privacy_ready
+            && match self.archive.chat(&canonical_id) {
+                Ok(Some(chat)) => chat.can_send(),
+                Ok(None) => ChatKind::from_id(&canonical_id) != ChatKind::Broadcast,
+                Err(_) => false,
+            };
+        if !writable {
+            let _ = reply.send(Err("This conversation is read-only in ZapFast".to_owned()));
+            return;
+        }
+
+        let mut message = outgoing_text(text.clone(), None, &[]);
+        let expiration = self.apply_ephemeral(&canonical_id, &mut message);
+        let id = client.generate_message_id();
+        let row = Message {
+            id: id.clone(),
+            chat: canonical_id.clone(),
+            sender: self.me(),
+            sender_name: None,
+            from_me: true,
+            timestamp: crate::util::now(),
+            content: Content::text(text),
+            status: Delivery::Pending,
+            delivered_at: None,
+            read_at: None,
+            quoted: None,
+            reactions: Vec::new(),
+            edited: false,
+            mentions: Vec::new(),
+            forwarded: false,
+            thumbnail: None,
+        };
+        self.store_message(row, Some(message.encode_to_vec()), None);
+        tokio::spawn(send_outgoing(
+            client,
+            self.commands.clone(),
+            canonical_id.clone(),
+            jid,
+            id.clone(),
+            message,
+            expiration,
+        ));
+
+        let _ = reply.send(Ok(crate::mcp::McpSendResult {
+            id,
+            chat: canonical_id,
+            status: "pending".to_owned(),
+        }));
+    }
+
+    fn handle_mcp_reply_message(
+        &mut self,
+        chat_id: String,
+        message_id: String,
+        text: String,
+        reply: tokio::sync::oneshot::Sender<Result<crate::mcp::McpSendResult, String>>,
+    ) {
+        let canonical_id = self
+            .resolve_chat_by_name_or_id(&chat_id)
+            .map(|c| c.id)
+            .unwrap_or_else(|| self.canonical_str(&chat_id));
+        let (Some(client), Some(jid)) = (self.client.clone(), Self::jid_of(&canonical_id)) else {
+            let _ = reply.send(Err("Not connected to WhatsApp".to_owned()));
+            return;
+        };
+        let writable = self.privacy_ready
+            && match self.archive.chat(&canonical_id) {
+                Ok(Some(chat)) => chat.can_send(),
+                Ok(None) => ChatKind::from_id(&canonical_id) != ChatKind::Broadcast,
+                Err(_) => false,
+            };
+        if !writable {
+            let _ = reply.send(Err("This conversation is read-only in ZapFast".to_owned()));
+            return;
+        }
+
+        let mut quoted_row = None;
+        let context = {
+            if let Ok(Some(raw)) = self.archive.raw(&canonical_id, &message_id) {
+                if let Ok(quoted) = wa::Message::decode_from_slice(&raw) {
+                    if let Ok(Some(row)) = self.archive.message(&canonical_id, &message_id) {
+                        let sender = Self::jid_of(&row.sender).unwrap_or_else(|| jid.clone());
+                        let ctx =
+                            whatsapp_rust::wacore::proto_helpers::build_quote_context_with_info(
+                                row.id.clone(),
+                                &sender,
+                                &jid,
+                                &jid,
+                                &quoted,
+                            );
+                        quoted_row = Some(row);
+                        Some(ctx)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        if context.is_none() {
+            let _ = reply.send(Err(format!(
+                "Original message {message_id} not found in archive to quote"
+            )));
+            return;
+        }
+
+        let mut message = outgoing_text(text.clone(), context, &[]);
+        let expiration = self.apply_ephemeral(&canonical_id, &mut message);
+        let id = client.generate_message_id();
+        let row = Message {
+            id: id.clone(),
+            chat: canonical_id.clone(),
+            sender: self.me(),
+            sender_name: None,
+            from_me: true,
+            timestamp: crate::util::now(),
+            content: Content::text(text),
+            status: Delivery::Pending,
+            delivered_at: None,
+            read_at: None,
+            quoted: quoted_row.map(|row| Quoted {
+                mentions: row.mentions.clone(),
+                id: row.id,
+                sender_name: if row.from_me {
+                    Some("You".to_owned())
+                } else {
+                    row.sender_name
+                        .clone()
+                        .or_else(|| self.name_for(&row.sender))
+                },
+                sender: row.sender,
+                summary: row.content.summary(),
+            }),
+            reactions: Vec::new(),
+            edited: false,
+            mentions: Vec::new(),
+            forwarded: false,
+            thumbnail: None,
+        };
+        self.store_message(row, Some(message.encode_to_vec()), None);
+        tokio::spawn(send_outgoing(
+            client,
+            self.commands.clone(),
+            canonical_id.clone(),
+            jid,
+            id.clone(),
+            message,
+            expiration,
+        ));
+
+        let _ = reply.send(Ok(crate::mcp::McpSendResult {
+            id,
+            chat: canonical_id,
+            status: "pending".to_owned(),
+        }));
+    }
+
+    fn handle_mcp_react_message(
+        &mut self,
+        chat_id: String,
+        message_id: String,
+        emoji: String,
+        reply: tokio::sync::oneshot::Sender<Result<bool, String>>,
+    ) {
+        let canonical_id = self.canonical_str(&chat_id);
+        self.react(canonical_id, message_id, emoji);
+        let _ = reply.send(Ok(true));
+    }
+
+    fn handle_mcp_mark_read(
+        &mut self,
+        chat_id: String,
+        reply: tokio::sync::oneshot::Sender<Result<bool, String>>,
+    ) {
+        let canonical_id = self.canonical_str(&chat_id);
+        self.mark_read(canonical_id, true);
+        let _ = reply.send(Ok(true));
+    }
+
+    fn handle_mcp_download_attachment(
+        &mut self,
+        chat_id: String,
+        message_id: String,
+        reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+    ) {
+        let canonical_id = self.canonical_str(&chat_id);
+        match self.archive.message(&canonical_id, &message_id) {
+            Ok(Some(mut message)) => {
+                self.polish(&mut message);
+                if let Some(media) = message.content.media() {
+                    if let Some(path) = &media.path {
+                        let _ = reply.send(Ok(path.to_string_lossy().into_owned()));
+                        return;
+                    }
+                }
+                self.download(canonical_id.clone(), message_id.clone());
+                let _ = reply.send(Err(
+                    "Attachment download queued in background. Please retry once downloaded."
+                        .to_owned(),
+                ));
+            }
+            Ok(None) => {
+                let _ = reply.send(Err(format!(
+                    "Message {message_id} not found in chat {canonical_id}"
+                )));
+            }
+            Err(err) => {
+                let _ = reply.send(Err(format!("Database error: {err}")));
+            }
+        }
+    }
+
+    fn handle_mcp_edit_message(
+        &mut self,
+        chat_id: String,
+        message_id: String,
+        text: String,
+        reply: tokio::sync::oneshot::Sender<Result<crate::mcp::McpSendResult, String>>,
+    ) {
+        let chat = match self.resolve_chat_by_name_or_id(&chat_id) {
+            Some(c) => c,
+            None => {
+                let _ = reply.send(Err(format!("Chat '{chat_id}' not found by ID or name")));
+                return;
+            }
+        };
+        let canonical_id = chat.id;
+        let (Some(client), Some(jid)) = (self.client.clone(), Self::jid_of(&canonical_id)) else {
+            let _ = reply.send(Err("Not connected to WhatsApp".to_owned()));
+            return;
+        };
+
+        let content = Content::text(text.clone());
+        if let Ok(true) = self
+            .archive
+            .set_edited_text(&canonical_id, &message_id, &content, &[])
+        {
+            self.emit_message(&canonical_id, &message_id);
+            self.emit_chat(&canonical_id);
+        }
+
+        let mut message = outgoing_text(text, None, &[]);
+        self.apply_ephemeral(&canonical_id, &mut message);
+        let commands = self.commands.clone();
+        let edit_chat = canonical_id.clone();
+        let edit_msg_id = message_id.clone();
+        tokio::spawn(async move {
+            if let Err(error) = client.edit_message(jid, edit_msg_id, message).await {
+                let _ = commands.send(Command::Sent {
+                    chat: edit_chat,
+                    id: String::new(),
+                    error: Some(format!("Could not send the edit: {error}")),
+                });
+            }
+        });
+
+        let _ = reply.send(Ok(crate::mcp::McpSendResult {
+            id: message_id,
+            chat: canonical_id,
+            status: "edited".to_owned(),
+        }));
+    }
+
+    fn handle_mcp_delete_message(
+        &mut self,
+        chat_id: String,
+        message_id: String,
+        reply: tokio::sync::oneshot::Sender<Result<crate::mcp::McpSendResult, String>>,
+    ) {
+        let chat = match self.resolve_chat_by_name_or_id(&chat_id) {
+            Some(c) => c,
+            None => {
+                let _ = reply.send(Err(format!("Chat '{chat_id}' not found by ID or name")));
+                return;
+            }
+        };
+        let canonical_id = chat.id;
+        let (Some(client), Some(jid)) = (self.client.clone(), Self::jid_of(&canonical_id)) else {
+            let _ = reply.send(Err("Not connected to WhatsApp".to_owned()));
+            return;
+        };
+
+        if let Ok(true) =
+            self.archive
+                .set_content(&canonical_id, &message_id, &Content::Revoked, false)
+        {
+            self.emit_message(&canonical_id, &message_id);
+            self.emit_chat(&canonical_id);
+        }
+
+        let commands = self.commands.clone();
+        let revoke_chat = canonical_id.clone();
+        let revoke_msg_id = message_id.clone();
+        tokio::spawn(async move {
+            if let Err(error) = client
+                .revoke_message(jid, revoke_msg_id, RevokeType::Sender)
+                .await
+            {
+                let _ = commands.send(Command::Sent {
+                    chat: revoke_chat,
+                    id: String::new(),
+                    error: Some(format!(
+                        "Could not delete the message for everyone: {error}"
+                    )),
+                });
+            }
+        });
+
+        let _ = reply.send(Ok(crate::mcp::McpSendResult {
+            id: message_id,
+            chat: canonical_id,
+            status: "revoked".to_owned(),
+        }));
+    }
+
+    fn handle_mcp_batch_edit_messages(
+        &mut self,
+        default_chat_id: Option<String>,
+        edits: Vec<serde_json::Value>,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<crate::mcp::McpActionResult>, String>>,
+    ) {
+        let mut results = Vec::new();
+        for edit_val in edits {
+            let chat_id = edit_val
+                .get("chat_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+                .or_else(|| default_chat_id.clone())
+                .unwrap_or_default();
+            let message_id = edit_val
+                .get("message_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned();
+            let text = edit_val
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned();
+
+            let (tx, mut rx) = tokio::sync::oneshot::channel();
+            self.handle_mcp_edit_message(chat_id.clone(), message_id.clone(), text, tx);
+            match rx.try_recv() {
+                Ok(Ok(res)) => {
+                    results.push(crate::mcp::McpActionResult {
+                        action: "edit".to_owned(),
+                        chat_id: res.chat,
+                        success: true,
+                        error: None,
+                        message_id: Some(res.id),
+                    });
+                }
+                Ok(Err(err)) => {
+                    results.push(crate::mcp::McpActionResult {
+                        action: "edit".to_owned(),
+                        chat_id,
+                        success: false,
+                        error: Some(err),
+                        message_id: Some(message_id),
+                    });
+                }
+                Err(_) => {
+                    results.push(crate::mcp::McpActionResult {
+                        action: "edit".to_owned(),
+                        chat_id,
+                        success: false,
+                        error: Some("Channel dropped".to_owned()),
+                        message_id: Some(message_id),
+                    });
+                }
+            }
+        }
+        let _ = reply.send(Ok(results));
+    }
+
+    fn handle_mcp_batch_delete_messages(
+        &mut self,
+        default_chat_id: Option<String>,
+        message_ids: Vec<String>,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<crate::mcp::McpActionResult>, String>>,
+    ) {
+        let mut results = Vec::new();
+        let target_chat = default_chat_id.unwrap_or_default();
+        for message_id in message_ids {
+            let (tx, mut rx) = tokio::sync::oneshot::channel();
+            self.handle_mcp_delete_message(target_chat.clone(), message_id.clone(), tx);
+            match rx.try_recv() {
+                Ok(Ok(res)) => {
+                    results.push(crate::mcp::McpActionResult {
+                        action: "delete".to_owned(),
+                        chat_id: res.chat,
+                        success: true,
+                        error: None,
+                        message_id: Some(res.id),
+                    });
+                }
+                Ok(Err(err)) => {
+                    results.push(crate::mcp::McpActionResult {
+                        action: "delete".to_owned(),
+                        chat_id: target_chat.clone(),
+                        success: false,
+                        error: Some(err),
+                        message_id: Some(message_id),
+                    });
+                }
+                Err(_) => {
+                    results.push(crate::mcp::McpActionResult {
+                        action: "delete".to_owned(),
+                        chat_id: target_chat.clone(),
+                        success: false,
+                        error: Some("Channel dropped".to_owned()),
+                        message_id: Some(message_id),
+                    });
+                }
+            }
+        }
+        let _ = reply.send(Ok(results));
+    }
+
+    fn handle_mcp_batch_actions(
+        &mut self,
+        actions: Vec<serde_json::Value>,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<crate::mcp::McpActionResult>, String>>,
+    ) {
+        let mut results = Vec::new();
+        for action_val in actions {
+            let action_type = action_val
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let chat_id = action_val
+                .get("chat_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned();
+            let canonical_id = self.canonical_str(&chat_id);
+
+            match action_type {
+                "react" => {
+                    let message_id = action_val
+                        .get("message_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_owned();
+                    let emoji = action_val
+                        .get("emoji")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_owned();
+                    self.react(canonical_id.clone(), message_id.clone(), emoji);
+                    results.push(crate::mcp::McpActionResult {
+                        action: "react".to_owned(),
+                        chat_id: canonical_id,
+                        success: true,
+                        error: None,
+                        message_id: Some(message_id),
+                    });
+                }
+                "mark_read" => {
+                    self.mark_read(canonical_id.clone(), true);
+                    results.push(crate::mcp::McpActionResult {
+                        action: "mark_read".to_owned(),
+                        chat_id: canonical_id,
+                        success: true,
+                        error: None,
+                        message_id: None,
+                    });
+                }
+                "send" => {
+                    let text = action_val
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_owned();
+                    let (tx, mut rx) = tokio::sync::oneshot::channel();
+                    self.handle_mcp_send_message(canonical_id.clone(), text, tx);
+                    match rx.try_recv() {
+                        Ok(Ok(res)) => {
+                            results.push(crate::mcp::McpActionResult {
+                                action: "send".to_owned(),
+                                chat_id: canonical_id,
+                                success: true,
+                                error: None,
+                                message_id: Some(res.id),
+                            });
+                        }
+                        Ok(Err(err)) => {
+                            results.push(crate::mcp::McpActionResult {
+                                action: "send".to_owned(),
+                                chat_id: canonical_id,
+                                success: false,
+                                error: Some(err),
+                                message_id: None,
+                            });
+                        }
+                        Err(_) => {
+                            results.push(crate::mcp::McpActionResult {
+                                action: "send".to_owned(),
+                                chat_id: canonical_id,
+                                success: false,
+                                error: Some("Channel dropped".to_owned()),
+                                message_id: None,
+                            });
+                        }
+                    }
+                }
+                "reply" | "quote" => {
+                    let text = action_val
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_owned();
+                    let message_id = action_val
+                        .get("message_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_owned();
+                    let (tx, mut rx) = tokio::sync::oneshot::channel();
+                    self.handle_mcp_reply_message(
+                        canonical_id.clone(),
+                        message_id.clone(),
+                        text,
+                        tx,
+                    );
+                    match rx.try_recv() {
+                        Ok(Ok(res)) => {
+                            results.push(crate::mcp::McpActionResult {
+                                action: "reply".to_owned(),
+                                chat_id: canonical_id,
+                                success: true,
+                                error: None,
+                                message_id: Some(res.id),
+                            });
+                        }
+                        Ok(Err(err)) => {
+                            results.push(crate::mcp::McpActionResult {
+                                action: "reply".to_owned(),
+                                chat_id: canonical_id,
+                                success: false,
+                                error: Some(err),
+                                message_id: Some(message_id),
+                            });
+                        }
+                        Err(_) => {
+                            results.push(crate::mcp::McpActionResult {
+                                action: "reply".to_owned(),
+                                chat_id: canonical_id,
+                                success: false,
+                                error: Some("Channel dropped".to_owned()),
+                                message_id: Some(message_id),
+                            });
+                        }
+                    }
+                }
+                "edit" | "update" => {
+                    let text = action_val
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_owned();
+                    let message_id = action_val
+                        .get("message_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_owned();
+                    let (tx, mut rx) = tokio::sync::oneshot::channel();
+                    self.handle_mcp_edit_message(
+                        canonical_id.clone(),
+                        message_id.clone(),
+                        text,
+                        tx,
+                    );
+                    match rx.try_recv() {
+                        Ok(Ok(res)) => {
+                            results.push(crate::mcp::McpActionResult {
+                                action: "edit".to_owned(),
+                                chat_id: res.chat,
+                                success: true,
+                                error: None,
+                                message_id: Some(res.id),
+                            });
+                        }
+                        Ok(Err(err)) => {
+                            results.push(crate::mcp::McpActionResult {
+                                action: "edit".to_owned(),
+                                chat_id: canonical_id,
+                                success: false,
+                                error: Some(err),
+                                message_id: Some(message_id),
+                            });
+                        }
+                        Err(_) => {
+                            results.push(crate::mcp::McpActionResult {
+                                action: "edit".to_owned(),
+                                chat_id: canonical_id,
+                                success: false,
+                                error: Some("Channel dropped".to_owned()),
+                                message_id: Some(message_id),
+                            });
+                        }
+                    }
+                }
+                "delete" | "revoke" => {
+                    let message_id = action_val
+                        .get("message_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_owned();
+                    let (tx, mut rx) = tokio::sync::oneshot::channel();
+                    self.handle_mcp_delete_message(canonical_id.clone(), message_id.clone(), tx);
+                    match rx.try_recv() {
+                        Ok(Ok(res)) => {
+                            results.push(crate::mcp::McpActionResult {
+                                action: "delete".to_owned(),
+                                chat_id: res.chat,
+                                success: true,
+                                error: None,
+                                message_id: Some(res.id),
+                            });
+                        }
+                        Ok(Err(err)) => {
+                            results.push(crate::mcp::McpActionResult {
+                                action: "delete".to_owned(),
+                                chat_id: canonical_id,
+                                success: false,
+                                error: Some(err),
+                                message_id: Some(message_id),
+                            });
+                        }
+                        Err(_) => {
+                            results.push(crate::mcp::McpActionResult {
+                                action: "delete".to_owned(),
+                                chat_id: canonical_id,
+                                success: false,
+                                error: Some("Channel dropped".to_owned()),
+                                message_id: Some(message_id),
+                            });
+                        }
+                    }
+                }
+                unknown => {
+                    results.push(crate::mcp::McpActionResult {
+                        action: unknown.to_owned(),
+                        chat_id: canonical_id,
+                        success: false,
+                        error: Some(format!("Unsupported action type: {unknown}")),
+                        message_id: None,
+                    });
+                }
+            }
+        }
+        let _ = reply.send(Ok(results));
+    }
+
+    fn configure_mcp(&mut self, enabled: bool, port: u16, token: String) {
+        let port = if port == 0 { 8765 } else { port };
+        let token = token.trim().to_string();
+
+        if let Some(shutdown_tx) = &self.mcp_shutdown {
+            if enabled && self.mcp_port == port && self.mcp_token == token {
+                return;
+            }
+            let _ = shutdown_tx.send(true);
+            self.mcp_shutdown = None;
+        }
+
+        self.mcp_port = port;
+        self.mcp_token = token.clone();
+
+        if enabled && !token.is_empty() {
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            self.mcp_shutdown = Some(shutdown_tx);
+            tokio::spawn(crate::mcp::server::start_server(
+                self.commands.clone(),
+                port,
+                token,
+                shutdown_rx,
+            ));
+        }
     }
 
     fn send_text(

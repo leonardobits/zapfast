@@ -389,6 +389,12 @@ pub struct Settings {
     pub chat_lock_code_hash: Option<String>,
     /// The one-time locked-chat code hint has been opened.
     pub chat_lock_hint_dismissed: bool,
+    /// Whether the embedded Model Context Protocol (MCP) server is enabled.
+    pub mcp_enabled: bool,
+    /// Port for the embedded MCP HTTP/SSE server.
+    pub mcp_port: u16,
+    /// Secret bearer token required to authenticate with the MCP server.
+    pub mcp_token: String,
 }
 
 impl Default for Settings {
@@ -431,6 +437,9 @@ impl Default for Settings {
             chat_lock_code: None,
             chat_lock_code_hash: None,
             chat_lock_hint_dismissed: false,
+            mcp_enabled: false,
+            mcp_port: 8765,
+            mcp_token: String::new(),
         }
     }
 }
@@ -472,6 +481,47 @@ impl Settings {
             .map(str::trim)
             .filter(|key| !key.is_empty())
             .map(str::to_owned)
+    }
+
+    /// Generates a cryptographically secure 32-byte hex token prefixed with `zapfast_`.
+    pub fn generate_mcp_token() -> String {
+        let mut bytes = [0u8; 32];
+        if getrandom::fill(&mut bytes).is_err() {
+            for byte in &mut bytes {
+                *byte = rand::random();
+            }
+        }
+        format!("zapfast_{}", hex(&bytes))
+    }
+
+    /// Returns the active MCP token, generating and assigning a secure one if empty.
+    pub fn ensure_mcp_token(&mut self) -> &str {
+        if self.mcp_token.trim().is_empty() {
+            self.mcp_token = Self::generate_mcp_token();
+        }
+        &self.mcp_token
+    }
+
+    /// Formats a ready-to-use JSON configuration snippet for AI tools (Claude Desktop, Cursor, Antigravity).
+    pub fn mcp_client_config(&self) -> String {
+        let port = if self.mcp_port == 0 {
+            8765
+        } else {
+            self.mcp_port
+        };
+        let token = if self.mcp_token.trim().is_empty() {
+            "YOUR_TOKEN_HERE"
+        } else {
+            self.mcp_token.trim()
+        };
+        serde_json::to_string_pretty(&serde_json::json!({
+            "mcpServers": {
+                "zapfast": {
+                    "url": format!("http://127.0.0.1:{port}/sse?token={token}")
+                }
+            }
+        }))
+        .unwrap_or_default()
     }
 
     pub fn load(path: &Path) -> Self {
@@ -740,6 +790,22 @@ mod tests {
         assert_eq!(WallpaperColor::Beige.rgb(), [245, 241, 235]);
         assert_eq!(WallpaperColor::Black.rgb(), [22, 23, 23]);
         assert_eq!(WallpaperColor::WillowBrook.label(), "Willow Brook");
+    }
+
+    #[test]
+    fn mcp_settings_defaults_and_token_generation() {
+        let mut settings = Settings::default();
+        assert!(!settings.mcp_enabled);
+        assert_eq!(settings.mcp_port, 8765);
+        assert!(settings.mcp_token.is_empty());
+
+        let token = settings.ensure_mcp_token().to_string();
+        assert!(token.starts_with("zapfast_"));
+        assert_eq!(token.len(), 8 + 64);
+        assert_eq!(settings.ensure_mcp_token(), token);
+
+        let config = settings.mcp_client_config();
+        assert!(config.contains("http://127.0.0.1:8765/sse?token=zapfast_"));
     }
 }
 

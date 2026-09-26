@@ -697,15 +697,114 @@ fn sections(app: &App) -> Vec<Section> {
         },
     );
 
-    let mut about_section = Section::new(translated(locale, "About"));
-    about_section.block(
-        vec![
-            "ZapFast".into(),
-            translated(locale, "Keyboard shortcuts"),
-            translated(locale, "Source code"),
-        ],
-        |ui, app| about(app, ui),
+    let mut mcp_section = Section::new(translated(locale, "Model Context Protocol (MCP)"));
+    mcp_section.toggle(
+        translated(locale, "Enable MCP server"),
+        translated(
+            locale,
+            "Allow local AI assistants (Claude Desktop, Cursor, Antigravity) to query chats and send messages.",
+        ),
+        |settings| &mut settings.mcp_enabled,
     );
+    if app.settings.mcp_enabled {
+        let token = app.settings.mcp_token.clone();
+        let port = if app.settings.mcp_port == 0 {
+            8765
+        } else {
+            app.settings.mcp_port
+        };
+
+        mcp_section.row(
+            translated(locale, "Server port"),
+            translated(locale, "Local TCP port for HTTP and SSE endpoints (default: 8765)."),
+            move |ui, app| {
+                let mut port_str = port.to_string();
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut port_str)
+                        .font(theme::regular(13.0))
+                        .text_color(palette.text)
+                        .desired_width(100.0),
+                );
+                if response.changed() {
+                    if let Ok(p) = port_str.trim().parse::<u16>() {
+                        if p > 0 {
+                            app.settings.mcp_port = p;
+                            app.actions.push(Action::SettingsChanged);
+                        }
+                    }
+                }
+            },
+        );
+
+        mcp_section.row(
+            translated(locale, "Authentication token"),
+            translated(
+                locale,
+                "Required Bearer token to protect your WhatsApp data from unauthorized local access.",
+            ),
+            move |ui, app| {
+                ui.horizontal(|ui| {
+                    let mut token_display = token.clone();
+                    ui.add(
+                        egui::TextEdit::singleline(&mut token_display)
+                            .font(theme::regular(12.0))
+                            .text_color(palette.secondary)
+                            .desired_width(180.0)
+                            .password(true)
+                            .interactive(false),
+                    );
+                    if theme::soft_button(
+                        ui,
+                        &palette,
+                        Some(Icon::Copy),
+                        &crate::i18n::gettext(app.locale, "Copy"),
+                        false,
+                    )
+                    .clicked()
+                    {
+                        ui.ctx().copy_text(token.clone());
+                        app.toast(crate::i18n::gettext(app.locale, "MCP token copied"));
+                    }
+                    if theme::soft_button(
+                        ui,
+                        &palette,
+                        Some(Icon::Refresh),
+                        &crate::i18n::gettext(app.locale, "New"),
+                        false,
+                    )
+                    .clicked()
+                    {
+                        app.actions.push(Action::GenerateMcpToken);
+                        app.toast(crate::i18n::gettext(app.locale, "New MCP token generated"));
+                    }
+                });
+            },
+        );
+
+        let endpoint = format!("http://127.0.0.1:{port}/sse");
+        mcp_section.row(
+            translated(locale, "Agent configuration"),
+            format!("Endpoint: {endpoint}"),
+            move |ui, app| {
+                if theme::soft_button(
+                    ui,
+                    &palette,
+                    Some(Icon::Copy),
+                    &crate::i18n::gettext(app.locale, "Copy JSON config"),
+                    false,
+                )
+                .clicked()
+                {
+                    let config = app.settings.mcp_client_config();
+                    ui.ctx().copy_text(config);
+                    app.toast(crate::i18n::gettext(
+                        app.locale,
+                        "MCP JSON configuration copied",
+                    ));
+                }
+            },
+        );
+    }
 
     vec![
         appearance,
@@ -715,6 +814,7 @@ fn sections(app: &App) -> Vec<Section> {
         system,
         account_section,
         files,
+        mcp_section,
         about_section,
     ]
 }

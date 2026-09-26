@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
+pub use crate::mcp::McpCommand;
 use crate::model::{Chat, ChatId, Contact, Gif, GifError, Message, PollDraft, StickerPack};
 use crate::paths::AppDirs;
 
@@ -115,6 +116,14 @@ pub struct CreatedPoll {
 
 #[derive(Debug)]
 pub enum Command {
+    /// Configures the embedded MCP server state.
+    ConfigureMcp {
+        enabled: bool,
+        port: u16,
+        token: String,
+    },
+    /// Dispatched from the embedded MCP HTTP server.
+    Mcp(McpCommand),
     RefreshPoll {
         chat: ChatId,
         message: String,

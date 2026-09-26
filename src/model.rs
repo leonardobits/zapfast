@@ -1517,6 +1517,8 @@ pub enum Action {
     SetProxy(String),
     /// Plays a notification sound once, as a preview.
     PreviewSound(crate::settings::NotificationSound),
+    /// Generates a new random bearer token for the MCP server.
+    GenerateMcpToken,
     ZoomBy(f32),
     ResetZoom,
     /// Requests a pairing code for a phone number.

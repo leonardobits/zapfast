@@ -847,10 +847,17 @@ impl App {
             notification_opens: Default::default(),
             notifications: Default::default(),
             badge: None,
-        };
         // A hand-edited speed snaps to a supported one, so a speed control
         // always shows the speed that plays.
         app.settings.voice_speed = app.player.set_speed(app.settings.voice_speed);
+        if app.settings.mcp_enabled {
+            let token = app.settings.ensure_mcp_token().to_string();
+            app.backend.send(Command::ConfigureMcp {
+                enabled: true,
+                port: app.settings.mcp_port,
+                token,
+            });
+        }
         app
     }
 
@@ -4422,7 +4429,29 @@ impl App {
                 self.search_hits.clear();
                 self.mark_settings_dirty();
             }
-            Action::SettingsChanged => self.mark_settings_dirty(),
+            Action::SettingsChanged => {
+                let token = if self.settings.mcp_enabled {
+                    self.settings.ensure_mcp_token().to_string()
+                } else {
+                    self.settings.mcp_token.clone()
+                };
+                self.backend.send(Command::ConfigureMcp {
+                    enabled: self.settings.mcp_enabled,
+                    port: self.settings.mcp_port,
+                    token,
+                });
+                self.mark_settings_dirty();
+            }
+            Action::GenerateMcpToken => {
+                let token = crate::settings::Settings::generate_mcp_token();
+                self.settings.mcp_token = token.clone();
+                self.backend.send(Command::ConfigureMcp {
+                    enabled: self.settings.mcp_enabled,
+                    port: self.settings.mcp_port,
+                    token,
+                });
+                self.mark_settings_dirty();
+            }
             Action::SetAccountPrivacy { kind, choice } => {
                 // The value lives on the phone: nothing is written without a
                 // connection and a snapshot to write against.
